@@ -1,0 +1,285 @@
+---
+title: "Supplementary Code, Case Study"
+author: "Julia Karagicheva and Eldar Rakhimberdiev"
+date: "2023-02-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Supplement to: Karagicheva et al. "The need to account for Argos Doppler errors when estimating habitat use from Argos Doppler locations: evidence and solution." 
+
+Authors: Eldar Rakhimberdiev and Julia Karagicheva 
+
+Depends:  R (>= 3.2.0)
+
+Date: 2023-02-27
+
+Description: This R code uses a case study of a PTT-tracked Black-tailed Godwit to demonstrate the performance of habitat selection analyses, using 1) raw Argos locations; 2.) SSM-improved Argos locations; and 3.) the SSM-derived 'most likely habitat' approach. 
+
+
+### Load required R packages
+```{r, eval=FALSE}
+library(rgeos)
+library(maptools)
+library(rgdal)
+data(wrld_simpl)
+library(dplyr)
+library(tidyr)
+library(sf)
+library(lubridate)
+library(raster)
+library(ggplot2)
+library('mvnfast')
+library('mvtnorm')
+library(tidyverse)
+library(ctmm)
+library('Rcpp')
+library(ggpubr)
+```
+
+### Load data
+
+Load the habitat map.
+```{r, eval=FALSE}
+Cur_sf <- st_read('Std_Dev_polygons_rdnew.shp')
+Cur_sf <- Cur_sf %>% sf:::select.sf(habitat)
+```
+
+Load the Argos (PTT) tracks of one individual Black-tailed Godwit. 
+```{r, eval=FALSE}
+Individual_W<-read.csv2(file='Individual_W_track.csv',stringsAsFactors=F)
+
+# Format date-time
+Individual_W$Date <- as.POSIXct(Individual_W$timestamp ,origin='1970-01-01 00:00.00 UTC', tz='GMT')
+
+Individual_W$argos_semi_major<-Individual_W$argos.semi.major
+Individual_W$argos_semi_minor<-Individual_W$argos.semi.minor
+Individual_W$argos_orientation<-Individual_W$argos.orientation
+
+# Select higher quality fixes
+Individual_W <- Individual_W[Individual_W$argos.lc %in% c("1","2","3"),]
+
+# Remove fixes with missing ellipse paramaters and fixes outside of the Netherlands
+Individual_W<-Individual_W %>% 
+  filter(!is.na(location.long)) %>% 
+  filter(argos_semi_major!=0) %>% 
+  filter(argos_semi_minor!=0) %>% 
+  filter(location.lat>52.8)
+
+# Convert to sf object and reproject to CRS of habitat map
+Individual_W_sf <- st_as_sf(Individual_W, 
+                            coords = c("location.long", "location.lat"),
+                            crs = 4326)
+
+Individual_W_sf <- Individual_W_sf %>% 
+  st_transform(crs = crs(Cur_sf))
+```
+
+Visualize the habitat map and track locations.
+```{r, eval=FALSE}
+plot(st_geometry(Cur_sf))
+plot(st_geometry(Individual_W_sf), pch='.', col='red', add=T)
+```
+
+### 1. Sample habitats using raw Argos (most likely) locations
+
+Crop the tracking data to the study area, using a buffer with 50 meter margins. Sample the underlying habitat.
+```{r, eval=FALSE}
+Buffer_50 <- Cur_sf %>% 
+  st_union() %>% 
+  st_buffer(dist=50, capStyle="ROUND", joinStyle="ROUND", mitreLimit=1.0) %>% 
+  st_as_sf()
+
+Buffer_50$in_buffer <- 1
+
+overlay <- st_join(Individual_W_sf, Cur_sf, join = st_within)
+
+overlay_buffer <- st_join(overlay, Buffer_50, join=st_within)
+
+overlay_buffer$habitat[is.na(overlay_buffer$habitat) & !is.na(overlay_buffer$in_buffer)] <- 'not_assigned'
+
+Individual_W_overlay_buffer <- overlay_buffer
+Individual_W_overlay_buffer$raw_argos_habitat <- Individual_W_overlay_buffer$habitat
+```
+
+### 2. Sample habitats using SSM-improved (most likely) locations
+
+Run CTMM to get SSM-improved locations. 
+```{r, eval=FALSE}
+Individual_W_overlay_buffer <- Individual_W_overlay_buffer %>% st_transform(crs = 4326)
+
+Data_for_ctmm <- Individual_W_overlay_buffer %>%
+  mutate(longitude = unlist(map(Individual_W_overlay_buffer$geometry,1)),
+         latitude = unlist(map(Individual_W_overlay_buffer$geometry,2))) %>%
+  st_drop_geometry() %>%
+  dplyr::select(timestamp=Date, longitude, latitude, 
+                Argos.semi.major=argos.semi.major, Argos.semi.minor=argos.semi.minor, Argos.orientation=argos.orientation) %>%
+  mutate(sensor_type='argos-doppler-shift')
+
+# Create a telemetry object
+Data_telemetry <- as.telemetry(Data_for_ctmm)
+
+# Create a good starting guess for ctmm model fit. Calculation time ~ 5 minutes
+GUESS <- ctmm.guess(Data_telemetry,CTMM=ctmm(error=TRUE),interactive=FALSE)
+
+# Stepwise fitting and selection of continuous-time movement models.
+FIT <- ctmm.select(Data_telemetry,GUESS,trace=TRUE,cores=6)
+
+# Estimate SSM-improved locations
+Pred <- predict(FIT, data=Data_telemetry,  t=Data_for_ctmm$timestamp) 
+```
+
+Sample the underlying habitat.
+```{r, eval=FALSE}  
+# Convert to sf object
+Pred_SPts <- st_as_sf(x=data.frame(ID=1:length(Pred@.Data[[2]]),
+                                   x=Pred@.Data[[2]], y=Pred@.Data[[3]]),
+                      coords=c('x', 'y'),  crs = projection(Pred)) %>%
+  st_transform(crs(Cur_sf))
+
+# Remove points outside the study area
+overlay_ctmm_area <- st_join(Pred_SPts, Cur_sf, join = st_within)
+overlay_ctmm_buffer <- st_join(Pred_SPts, Buffer_50, join = st_within)				
+
+ctmm_habitat_NA_within <- data.frame(habitat=overlay_ctmm_area$habitat, in_buffer=overlay_ctmm_buffer$in_buffer)
+
+ctmm_habitat_NA_within$habitat[is.na(ctmm_habitat_NA_within$habitat) & !is.na(ctmm_habitat_NA_within$in_buffer)]<-'not_assigned'
+
+# Add to the data frame
+Individual_W_overlay_buffer$ctmm_predicted_habitat <- ctmm_habitat_NA_within$habitat
+```
+
+### 3. Sample habitats using the 'most likely habitat' approach
+
+Run CTMM 100 times to obtain 100 SSM-improved locations around each fix. Sample the underlying habitat. 
+```{r, eval=FALSE}  
+all_out<-c()
+for (i in 1:100) {
+  cat('\r', i)
+  Sim_1<-simulate(FIT, data=Data_telemetry,  precompute = TRUE, t=Data_for_ctmm$timestamp) 
+  
+  Sim_SPts<-st_as_sf(x=data.frame(ID=1:length(Sim_1@.Data[[2]]),
+                                  x=Sim_1@.Data[[2]], y=Sim_1@.Data[[3]]),
+                     coords=c('x', 'y'),  crs = projection(Sim_1))  %>%
+    st_transform(crs(Cur_sf))
+  
+  overlay_sim_area<- st_join(Sim_SPts, Cur_sf, join = st_within)
+  overlay_sim_buffer<-st_join(Sim_SPts, Buffer_50, join = st_within)				
+  sim_habitat_NA_within<-data.frame(habitat=overlay_sim_area$habitat,
+                                    in_buffer=overlay_sim_buffer$in_buffer)
+  sim_habitat_NA_within$habitat[is.na(sim_habitat_NA_within$habitat) & !is.na(sim_habitat_NA_within$in_buffer)] <- 'not_assigned'
+  
+  all_out<-cbind(all_out, sim_habitat_NA_within$habitat)
+    }
+```  
+  
+### Summarize and map results
+
+Generate a habitat assignment data frame to analyze the results.
+```{r, eval=FALSE}     
+Habitat_types <- as.data.frame(t(apply(all_out, 1, FUN=function(x)
+  unlist(table(factor(x,  levels=c('high_change', 'intermediate', 'low_change',
+                                   'not_assigned' )))))))
+   
+Habitat_types$sum_points <- rowSums(Habitat_types[,c(1:4)])
+high_change <- as.data.frame(Habitat_types[,1])/Habitat_types$sum_points
+names(high_change) <- 'number'
+high_change$habitat <- 'high_change'
+intermediate <- as.data.frame(Habitat_types[,2])/Habitat_types$sum_points
+names(intermediate) <- 'number'
+intermediate$habitat <- 'intermediate'
+low_change <- as.data.frame(Habitat_types[,3])/Habitat_types$sum_points
+names(low_change) <- 'number'
+low_change$habitat <- 'low_change'
+not_assigned <- as.data.frame(Habitat_types[,4])/Habitat_types$sum_points
+names(not_assigned) <- 'number'
+not_assigned$habitat <- 'not_assigned'
+names(Habitat_types) <- paste0('ctmm_simulation_', names(Habitat_types))
+for_boxplot <- rbind(high_change, intermediate,low_change,not_assigned)
+
+# Append to the data frame
+Habitat_types$most.present.habitat_ctmm_sim <- apply(Habitat_types, 1,
+                                                     FUN=function(x)c('high_change', 'intermediate',
+                                                                      'low_change','not_assigned')[which.max(x[1:4])])
+
+Individual_W_overlay_buffer <- cbind(Individual_W_overlay_buffer, Habitat_types)
+
+# Visualize the results in a boxplot
+plot(number~as.factor(habitat),for_boxplot,col = "white")
+```
+
+```{r echo=FALSE, out.width="50%", fig.align='center'}
+knitr::include_graphics('Boxplot.png')
+```
+
+Results of habitat assignment using raw Argos locations (#1).
+```{r, eval=FALSE}  
+argos_HC <- as.numeric(table(Individual_W_overlay_buffer$raw_argos_habitat,useNA='ifany')[1])/nrow(Individual_W_overlay_buffer)
+argos_Int <- as.numeric(table(Individual_W_overlay_buffer$raw_argos_habitat,useNA='ifany')[2])/nrow(Individual_W_overlay_buffer)
+argos_LC <- as.numeric(table(Individual_W_overlay_buffer$raw_argos_habitat,useNA='ifany')[3])/nrow(Individual_W_overlay_buffer)
+argos_NA <- as.numeric(table(Individual_W_overlay_buffer$raw_argos_habitat,useNA='ifany')[4])/nrow(Individual_W_overlay_buffer)
+
+argos_output <- as.data.frame(c(argos_HC,argos_Int,argos_LC,argos_NA))
+names(argos_output) <- 'number'
+habitat <- c('high_change', 'intermediate', 'low_change','not_assigned')
+argos_output <- cbind(argos_output,habitat)
+```
+
+Results of habitat assignment using SSM-improved locations (#2).
+```{r, eval=FALSE}  
+ctmm_HC <- as.numeric(table(Individual_W_overlay_buffer$ctmm_predicted_habitat,useNA='ifany')[1])/nrow(Individual_W_overlay_buffer)
+ctmm_Int <- as.numeric(table(Individual_W_overlay_buffer$ctmm_predicted_habitat,useNA='ifany')[2])/nrow(Individual_W_overlay_buffer)
+ctmm_LC <- as.numeric(table(Individual_W_overlay_buffer$ctmm_predicted_habitat,useNA='ifany')[3])/nrow(Individual_W_overlay_buffer)
+ctmm_NA <- as.numeric(table(Individual_W_overlay_buffer$ctmm_predicted_habitat,useNA='ifany')[4])/nrow(Individual_W_overlay_buffer) 
+
+ctmm_output <- as.data.frame(c(ctmm_HC,ctmm_Int,ctmm_LC,ctmm_NA))
+names(ctmm_output) <- 'number'
+habitat <- c('high_change', 'intermediate', 'low_change','not_assigned')
+ctmm_output <- cbind(ctmm_output,habitat)
+```
+
+Results of habitat assignment using 'most likely habitat' approach (#3).
+```{r, eval=FALSE}  
+ML_HC <- as.numeric(table(Individual_W_overlay_buffer$most.present.habitat_ctmm_sim,useNA='ifany')[1])/nrow(Individual_W_overlay_buffer)
+ML_Int <- as.numeric(table(Individual_W_overlay_buffer$most.present.habitat_ctmm_sim,useNA='ifany')[2])/nrow(Individual_W_overlay_buffer)
+ML_LC <- as.numeric(table(Individual_W_overlay_buffer$most.present.habitat_ctmm_sim,useNA='ifany')[3])/nrow(Individual_W_overlay_buffer)
+ML_NA <- as.numeric(table(Individual_W_overlay_buffer$most.present.habitat_ctmm_sim,useNA='ifany')[4])/nrow(Individual_W_overlay_buffer) 
+ML_output <- as.data.frame(c(ML_HC,ML_Int,ML_LC,ML_NA))
+names(ML_output) <- 'number'
+habitat <- c('high_change', 'intermediate', 'low_change','not_assigned')
+ML_output <- cbind(ML_output,habitat)
+```   
+
+Map the results of the 'most likely habitat' approach.  
+```{r, eval=FALSE}  
+Individual_W_overlay_buffer$most.present.num[Individual_W_overlay_buffer$most.present.habitat_ctmm_sim=='high_change']<-1
+Individual_W_overlay_buffer$most.present.num[Individual_W_overlay_buffer$most.present.habitat_ctmm_sim=='intermediate']<-2
+Individual_W_overlay_buffer$most.present.num[Individual_W_overlay_buffer$most.present.habitat_ctmm_sim=='low_change']<-3
+Individual_W_overlay_buffer$most.present.num[is.na(Individual_W_overlay_buffer$most.present.habitat_ctmm_sim)]<-4
+
+
+Cur_sf$habitat_num[Cur_sf$habitat=="high_change"]<-1
+Cur_sf$habitat_num[Cur_sf$habitat=="intermediate"]<-2
+Cur_sf$habitat_num[Cur_sf$habitat=="low_change"]<-3
+
+Individual_W_overlay_buffer <- Individual_W_overlay_buffer %>% 
+  st_transform(crs = crs(Cur_sf))
+
+clrs<-c('red','blue','green4','black')
+clrs_map<-c('pink','powderblue','palegreen')
+clrs_map<-c('#fc8d62','#8da0cb','#66c2a5')
+
+plot(st_geometry(Cur_sf), border=grey(0.8),
+     col=clrs_map[Cur_sf$habitat_num],add=T )
+plot(st_geometry(Individual_W_overlay_buffer),
+     pch='.', col=clrs[Individual_W_overlay_buffer$most.present.num],
+     cex=3,add=TRUE)
+```
+
+```{r echo=FALSE, out.width="80%", fig.align='center'}
+knitr::include_graphics('Map.png')
+```
+

@@ -1,0 +1,30 @@
+# in this script I want to look into distribution of distances in the Argos fixes.
+# for this I want to generate 100 rndom points for each fix we have
+# and estimate distance between the point and the centre...
+
+
+get_ellipse_random_ditances<-function(n, data_row) {
+    VCmat_cur<-ellipse_params(data_row$argos_semi_major, data_row$argos_semi_minor, data_row$argos_orientation)$VCmat
+	Mean_cur<-c(0,0)
+	if (data_row$argos_semi_major == 0| data_row$argos_semi_minor==0) {
+       Points<-matrix(NA, nrow=n, ncol=2)
+	} else {
+       Points<-try(mvnfast::rmvn(n=n,mu=Mean_cur, sigma=VCmat_cur))
+	   if (class(Points)[1]=='try-error') {
+	     save(data_row, file='Data_row_tmp.RData')
+	     Points<-mvtnorm::rmvnorm(n=n, mean = Mean_cur, sigma = VCmat_cur)
+	   } 	
+    }	
+	
+   Distance<-sqrt(rowSums(Points^2))
+   return(Distance)
+}
+
+
+Distance<-c()
+for (i in 1:nrow(sp_act_god_noNA_quality_control)) {
+   Distance<-c(Distance, get_ellipse_random_ditances(n=100,sp_act_god_noNA_quality_control@data[i,]))
+   }
+
+summary(Distance)
+hist(DIstance,breaks=50,abline=median(Distance))

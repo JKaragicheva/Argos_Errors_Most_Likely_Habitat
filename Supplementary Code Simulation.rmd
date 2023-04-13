@@ -1,0 +1,591 @@
+15 March..
+attempt to find the trouble in the new model..
+At the moment we think that the trouble likely is in the ellipse generation functions, though we are not precisely sure as it might also sit in some of the estimation with the sf package.
+
+Actually it is more likely as we can have a problem in the distances, estimated by the sf...
+the problem is that we do everything within the loop, so we have to alternate loop and to save individual results immediately after simulation..
+All the outcomes of the simulation should be qite similar then..
+
+
+
+---
+title: "Supplementary Code, Simulation"
+author: "Julia Karagicheva and Eldar Rakhimberdiev"
+date: "2023-02-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Supplement to: Karagicheva et al. "The need to account for Argos Doppler errors when estimating habitat use from Argos Doppler locations: evidence and solution." 
+
+Depends:  R (>= 3.2.0)
+
+Date: 2023-02-27
+
+Description: This R code uses simulated Argos locations to demonstrate the performance of habitat selection analyses, using 1) raw Argos locations; 2.) SSM-improved Argos locations; and 3.) the SSM-derived 'most likely habitat' approach. Simulated locations are created using GPS tracks of Black-tailed Godwits. 
+
+
+### Load required R packages
+```{r, eval=FALSE}
+library(dplyr)
+library(tidyr)
+library(sp)
+library(sf)
+library(lubridate)
+library(raster)
+library(ggplot2)
+library('mvnfast')
+library('mvtnorm')
+library(tidyverse)
+library(ctmm)
+library('Rcpp')
+library(ggpubr)
+```
+
+### Ellipse functions
+
+Necessary functions for simulating Argos location error, written by Eldar Rakhimberdiev.
+```{r, eval=FALSE}
+ellipse_params<-function(semi_major, semi_minor, orientation, res.mat=FALSE) {
+   # original equations by McClintock MEE 2015
+   M_t=semi_major
+   m_t=semi_minor
+   c_t=orientation*pi/180
+   sigma_sq_x_t=(((M_t)*sin(c_t))^2 + ((m_t)*cos(c_t))^2)/2
+   sigma_sq_y_t=(((M_t)*cos(c_t))^2 + ((m_t)*sin(c_t))^2)/2
+   sigma_xy_t=(M_t^2-m_t^2)*cos(c_t)*sin(c_t)/2
+   VCmat<-matrix(c(sigma_sq_x_t, sigma_xy_t, sigma_xy_t, sigma_sq_y_t), nrow=2)
+   if (!res.mat) {
+      Res<-list(Mu=c(0,0), VCmat=VCmat)
+   } else {
+      Res<-cbind(sigma_sq_x_t, sigma_sq_y_t, sigma_xy_t)
+   }
+}
+
+long2UTM <- function(long) {
+    (floor((long + 180)/6) %% 60) + 1
+}
+
+get_grid_dmvn<-function(data_row, Grid) {
+    VCmat_cur<-ellipse_params(data_row$argos_semi_major, data_row$argos_semi_minor, data_row$argos_orientation)$VCmat
+	Mean_cur<-c(data_row$longUTM,data_row$latUTM)
+	
+	if (data_row$argos_semi_major == 0| data_row$argos_semi_minor==0) {
+	Z<-rep(0,nrow(Grid))
+	} else {
+    Z<-try(apply(Grid, 1, FUN=function(x) 
+			       mvnfast::dmvn(c(x[1], x[2]) ,mu=Mean_cur,
+				        sigma=VCmat_cur)))
+	if (class(Z)=='try-error') {
+	save(data_row, file='Data_row_tmp.RData')
+	Z<-apply(Grid, 1, FUN=function(x) 
+	               mvtnorm::dmvnorm(c(x[1], x[2]), mean = Mean_cur, 
+				   sigma = VCmat_cur))
+	} 	
+    }	
+	return(Z)
+}
+
+get_grid_dmvn<-compiler::cmpfun(get_grid_dmvn)
+
+get_ellipse_random_points<-function(n, data_row) {
+    VCmat_cur<-ellipse_params(data_row$argos_semi_major, data_row$argos_semi_minor, data_row$argos_orientation)$VCmat
+	Mean_cur<-c(data_row$longUTM,data_row$latUTM)
+	if (data_row$argos_semi_major == 0| data_row$argos_semi_minor==0) {
+       Points<-matrix(NA, nrow=n, ncol=2)
+	} else {
+       Points<-try(mvnfast::rmvn(n=n,mu=Mean_cur, sigma=VCmat_cur))
+	   if (class(Points)[1]=='try-error') {
+	     save(data_row, file='Data_row_tmp.RData')
+	     Points<-mvtnorm::rmvnorm(n=n, mean = Mean_cur, sigma = VCmat_cur)
+	   } 	
+    }	
+	return(Points)
+}
+```
+
+
+### Load Data 
+
+Load the habitat map.
+
+```{r, eval=FALSE}
+Cur_sf <- st_read('.\\Ruth_map\\Std_Dev_polygons_rdnew.shp')
+Cur_sf <- Cur_sf %>% sf:::select.sf(habitat)
+```
+
+To distinguish between points falling beyond the map range and those falling on the 'not assigned' habitat within the map, create a 50 meter buffer.  
+```{r, eval=FALSE}
+Buffer_50_st <- Cur_sf %>% 
+  st_union() %>% 
+  st_buffer(dist=50, capStyle="ROUND", joinStyle="ROUND", mitreLimit=1.0) %>% 
+  st_as_sf()
+
+Buffer_50_st$in_buffer <- 1
+```
+
+Load Argos (PTT) tracks of 14 individual Black-tailed Godwits. 
+```{r, eval=FALSE}
+act_god <- read.csv(file='Active Godwits_08_12_2020.csv',stringsAsFactors=F)
+```
+
+Load GPS track of one individual Black-tailed Godwit.
+```{r, eval=FALSE}
+uva2002 <- read.csv(file='UVA_TRACKER2002.csv',stringsAsFactors=F)  %>%
+subset(select=c('device_info_serial', 'date_time', 'latitude', 'longitude'))
+
+# Format columns
+uva2002$datetime <- as.POSIXct(uva2002$date_time, format = "%m/%d/%Y %H:%M", tz = "UTC") 
+uva2002$Date <- as.POSIXct(uva2002$date_time, format = "%m/%d/%Y", tz = "UTC") 
+uva2002$fixID<-rownames(uva2002)
+
+# Transform from longlat to UTM
+Cur_zone<-31
+
+uva2002_SP_sf_UTM<-st_as_sf(x=uva2002, coords=c('longitude', 'latitude'),  
+                            crs = CRS("+init=epsg:4326"), remove=FALSE) %>%
+  st_transform( crs=CRS(paste0('+proj=utm +zone=',Cur_zone, ' datum=WGS84')))
+
+uva2002_SP_sf_UTM[c('longUTM', 'latUTM')]<-st_coordinates(uva2002_SP_sf_UTM)
+
+uva2002_SP_sf_RDn<-st_transform(uva2002_SP_sf_UTM, crs(Cur_sf))
+
+# Extract only locations in the Netherlands
+uva2002_SP_RDn_NL_habitat<-uva2002_SP_sf_UTM %>% 
+                           filter(latitude>52.8) %>% 
+                           filter(datetime < as.POSIXct("2014-01-01 UTC")) %>%
+                           st_transform(crs(Cur_sf))
+
+# Format data
+gps_samp <- uva2002_SP_RDn_NL_habitat %>% 
+  sf:::select.sf(gps_longUTM=longUTM, gps_latUTM=latUTM, 
+                 fixID=fixID, datetime=datetime)
+ 
+```
+
+### Run Simulation 
+
+Sample habitat at 'true' GPS locations. 
+```{r, eval=FALSE} 
+input_gps_coords <- st_as_sf(x=gps_samp, 
+                           coords=c('gps_longUTM', 'gps_latUTM'),
+                           rs=CRS(paste0('+proj=utm +zone=',Cur_zone))) %>%
+  st_transform(crs(Cur_sf))
+
+gps_habitat_NA_within <- input_gps_coords %>% 
+  st_join(Cur_sf, join = st_within) %>% 
+  st_join(Buffer_50_st, join = st_within)
+
+# Identify 'not assigned' habitat   
+gps_habitat_NA_within$habitat[is.na(gps_habitat_NA_within$habitat) & !is.na(gps_habitat_NA_within$in_buffer)] <- 'not_assigned'
+   
+gps_RDnew<-as.data.frame(st_coordinates(input_gps_coords))
+names(gps_RDnew)<-c('gps_RDn_lon','gps_RDn_lat')
+```
+
+Simulate an Argos track by scattering points within an Argos error ellipse.
+```{r, eval=FALSE}
+simulate_arg_track <- function(x) {
+  data_row<-as.data.frame(x)
+  arg_sim_track<-data.frame(get_ellipse_random_points(1,data_row))
+  return(arg_sim_track)
+}
+```
+
+Prepare the Argos error ellipse data.
+```{r, eval=FALSE}
+# Format date-time 
+act_god$datetime <- as.POSIXct(act_god$timestamp, 
+                               format = "%Y-%m-%d %H:%M:%S", 
+                               tz = "UTC")
+
+# Rename key columns
+act_god$argos_semi_major <- act_god$argos.semi.major
+act_god$argos_semi_minor <- act_god$argos.semi.minor
+act_god$argos_orientation <- act_god$argos.orientation
+
+# Select quality fixes
+act_god<-act_god[act_god$argos.lc %in% c("1","2","3"),]
+
+# Remove locations outside of the Netherlands 
+act_god_noNA <- act_god %>% 
+  filter(!is.na(location.long)) %>% 
+  filter(argos_semi_major!=0) %>% 
+  filter(argos_semi_minor!=0) %>% 
+  filter(location.lat>52.8)
+
+# Reproject to CRS of the study area
+sf_act_god_noNA <- st_as_sf(x=act_god_noNA,
+                            coords=c('location.long','location.lat'),
+                            crs=CRS("+init=epsg:4326")) %>% 
+      st_transform(crs(Cur_sf))
+
+sf_act_god_noNA_quality_control <- sf_act_god_noNA
+```
+
+
+Run the simulations, using CTMM to fit SSMs, estimate the path 100 times while taking elliptical error into account, and sample the underlying habitat. This function will take some time. Output of each simulation run saves to an .RData file.
+```{r, eval=FALSE}
+Total_sims<-50
+n.simulations=100  
+
+for (j in 31:Total_sims) {
+   cat('\r doing', j, 'from ', Total_sims)
+   samp <- sample.int(nrow(sf_act_god_noNA_quality_control),nrow(uva2002_SP_RDn_NL_habitat),replace=TRUE)
+   arg_samp <- sf_act_god_noNA_quality_control[samp,c('argos_semi_major','argos_semi_minor','argos_orientation')] %>%
+   st_drop_geometry
+   arg_samp$samp <- samp
+
+   track_gps_arg <- cbind(gps_samp,arg_samp)
+
+   data_frame <- track_gps_arg %>% st_drop_geometry() %>% dplyr::select(longUTM=gps_longUTM,
+                                                 latUTM=gps_latUTM,argos_semi_major=argos_semi_major,
+                                                 argos_semi_minor=argos_semi_minor,argos_orientation=argos_orientation)
+
+   SP_nosp <- do.call(rbind, apply(data_frame,1, FUN=function(x) simulate_arg_track(as.data.frame(t(x)))))
+   
+   track_gps_arg[,c('x', 'y')] <- SP_nosp
+   
+   input <- st_as_sf(x=st_drop_geometry(track_gps_arg), coords=c('x', 'y'), 
+                   crs = CRS(paste0('+proj=utm +zone=', Cur_zone))) %>% 
+     st_transform( CRS("+init=epsg:4326")) 
+
+   input[, c('location_lon', 'location_lat')] <- input %>% 
+     st_coordinates()
+   Data_for_ctmm <- input %>% 
+     st_drop_geometry() %>% dplyr::select(timestamp=datetime, longitude=location_lon, 
+           latitude=location_lat, Argos.semi.major=argos_semi_major,
+           Argos.semi.minor=argos_semi_minor, Argos.orientation=argos_orientation) %>%
+           mutate(sensor_type='argos-doppler-shift') 
+           
+   cur_track_ctmm <- as.telemetry(Data_for_ctmm)
+   if (FALSE) {
+      plot(cur_track_ctmm)
+   }
+   # Automated guesstimate for calibrated data
+   GUESS <- ctmm.guess(cur_track_ctmm,CTMM=ctmm(error=TRUE),interactive=FALSE)
+
+   # Stepwise fitting of movement models -- this takes some time 
+   if (TRUE) {
+      FIT <- ctmm.select(cur_track_ctmm,GUESS,trace=FALSE,cores=6)
+	  
+    # If desired, may save the object for further re-use
+      #save(FIT, file='FIT_simulation.RData')
+   }
+  
+
+# Make a brick with three dimensions (coord, time, simID) to store output
+sim.brick <- array(NA, c( nrow(cur_track_ctmm), 2, n.simulations))
+
+# Run simulation
+Sim_1 <- simulate(FIT, data=cur_track_ctmm, precompute=TRUE, t=cur_track_ctmm$t) 
+   for (i in 1:n.simulations) {
+      cat('\r', i)
+      Sim_1 <- simulate(FIT, data=cur_track_ctmm, 
+                        precompute=-1, t=cur_track_ctmm$t) 
+      sim.brick[,,i]<- st_as_sf(x=data.frame(ID=1:length(Sim_1@.Data[[2]]),
+                                             x=Sim_1@.Data[[2]],
+                                             y=Sim_1@.Data[[3]]), coords=c('x', 'y'),  
+                                crs = projection(Sim_1))  %>% 
+      st_transform(crs('+proj=longlat +datum=WGS84 +no_defs')) %>%
+        st_coordinates()
+	  }
+
+# Overlay the output with the habitat map
+Output.sim<-Data_for_ctmm
+attr(Output.sim,"sim.error") <- sim.brick
+
+all_out <- c()
+for (i in 1:dim(attr(Output.sim,"sim.error"))[3]) {
+      cat('\r', i)
+
+      Sim_SPts <- st_as_sf(x=data.frame(x=attr(Output.sim,"sim.error")[,1,i],
+                                        y=attr(Output.sim,"sim.error")[,2,i]),
+                           coords=c('x', 'y'),  
+                           crs = crs('+proj=longlat +datum=WGS84 +no_defs')) %>%
+      st_transform(crs(Cur_sf))
+      
+				# Remove points outside the area
+				overlay_area <- st_join(Sim_SPts, Cur_sf, join = st_within)
+				overlay_buffer_sf <- st_join(Sim_SPts, Buffer_50_st, join = st_within)				
+				habitat_NA_within <- data.frame(habitat=overlay_area$habitat, in_buffer=overlay_buffer_sf$in_buffer)
+				habitat_NA_within$habitat[is.na(habitat_NA_within$habitat) & !is.na(habitat_NA_within$in_buffer)]<-'not_assigned'
+
+	  all_out <- cbind(all_out, habitat_NA_within$habitat)
+   }
+
+   Habitat_types <- as.data.frame(t(apply(all_out, 1, FUN=function(x)unlist(table(factor(x,  levels=c('high_change', 'intermediate', 'low_change', 'not_assigned' )), useNA='always')))))
+   names(Habitat_types) <- paste0('ctmm_simulation_', as.character(names(Habitat_types)))
+
+   Data_for_ctmm$most.present.habitat_ctmm_sim<-
+   apply(Habitat_types, 1, FUN=function(x) c('high_change', 'intermediate', 'low_change','not_assigned')[which.max(x[1:4])])
+   input_with_habitats <- cbind(Data_for_ctmm, Habitat_types)  
+
+	overlay_area_argos <- input %>% 
+	  st_transform(crs(Cur_sf)) %>% 
+	  st_join(Cur_sf, join = st_within)
+	overlay_buffer_sf_argos <- input %>% 
+	  st_transform(crs(Cur_sf)) %>% 
+	  st_join(Buffer_50_st, join = st_within)				
+	habitat_NA_within_argos <- data.frame(habitat=overlay_area_argos$habitat, in_buffer=overlay_buffer_sf_argos$in_buffer)
+	habitat_NA_within_argos$habitat[is.na(habitat_NA_within_argos$habitat) & !is.na(habitat_NA_within_argos$in_buffer)]<-'not_assigned'
+    
+   input_with_habitats$habitat_sim_arg_centre <-habitat_NA_within_argos$habitat
+
+  input_with_habitats <- input_with_habitats %>% 
+    rename(arg_sim_long=longitude, arg_sim_lat=latitude)
+
+# Predict locations using SSM
+   Pred<-predict(FIT, data=cur_track_ctmm,  t=cur_track_ctmm$t) 
+   
+   Pred_SPts<-st_as_sf(x=data.frame(ID=1:length(Pred@.Data[[2]]),
+                                    x=Pred@.Data[[2]], y=Pred@.Data[[3]]),
+                       coords=c('x', 'y'),  crs = projection(Pred)) %>% 
+      st_transform(crs(Cur_sf))
+   
+				# Remove points outside the area
+				overlay_ctmm_area <- st_join(Pred_SPts, Cur_sf, join = st_within)
+				overlay_ctmm_buffer <- st_join(Pred_SPts, Buffer_50_st, join = st_within)				
+				ctmm_habitat_NA_within <- data.frame(habitat=overlay_ctmm_area$habitat, in_buffer=overlay_ctmm_buffer$in_buffer)
+				ctmm_habitat_NA_within$habitat[is.na(habitat_NA_within$habitat) & !is.na(habitat_NA_within$in_buffer)]<-'not_assigned'
+   
+   input_with_habitats$ctmm_predicted_habitat<-ctmm_habitat_NA_within$habitat
+    
+ctmm_pred_coords<-Pred_SPts %>% 
+                     st_transform(crs('+proj=longlat +datum=WGS84 +no_defs')) %>%
+                     st_coordinates() %>% 
+                     as.data.frame()
+                     
+names(ctmm_pred_coords) <- c('ctmm_pred_longitude', 'ctmm_pred_latitude')
+   
+   output_with_everything <- cbind(input_with_habitats, ctmm_pred_coords,gps_RDnew)
+   
+   output_with_everything$gps_habitat <- gps_habitat_NA_within$habitat
+
+   filename<-paste0('Sim_', j, '_output_with_everything_not_assigned_cor_sf_v.2.RData')
+   save(output_with_everything, file=filename)
+}
+```
+
+###Analyse simulated tracks
+```{r, eval=FALSE}
+
+
+#list the files from the directory, where the simulation output was saved
+Files<-list.files("D:\\...", 'Sim_')
+
+##FIGURE 5
+#Study site with the GPS track of the godwit
+
+clrs<-c('#d95f02','#7570b3','#1b9e77',grey(0.9))
+clrs_map<-c('#fc8d62','#8da0cb','#66c2a5')
+
+Cur_sp$habitat_num[Cur_sp$habitat=="high_change"]<-1
+Cur_sp$habitat_num[Cur_sp$habitat=="intermediate"]<-2
+Cur_sp$habitat_num[Cur_sp$habitat=="low_change"]<-3
+
+output_with_everything_sp<-st_as_sf(x=output_with_everything, coords = c('gps_RDn_lon','gps_RDn_lat'), crs=crs(Cur_sp))
+
+x_coord<-c(158012.8, 158012.8,159000.0,159000.0, 158012.8)
+y_coord<-c(549500.0, 548366.0, 548366.0, 549500.0, 549500.0)
+xym <- cbind(x_coord, y_coord)
+xym
+p = Polygon(xym)
+ps = Polygons(list(p),1)
+sps = SpatialPolygons(list(ps))
+###############
+st_p<-st_polygon(x=list(xym)) %>% st_sfc(crs=crs(Cur_sp))
+
+
+
+plot(st_geometry(Cur_sp), border=grey(0.8),lwd=0.1, col=clrs_map[Cur_sp$habitat_num])
+plot(st_geometry(output_with_everything_sp),pch=".",cex=2,col='yellow',add=T)
+plot(st_p,add=T ,border='white',lwd=2)
+plot(st_geometry(sps),border='white',lwd=2,add=T)
+
+
+#Make a fragment of the map to show points in details
+
+#Give numbers to the habitat types for each of the approaches
+
+output_with_everything_sp$gps_habitat_num[output_with_everything_sp$gps_habitat=='high_change']<-1
+output_with_everything_sp$gps_habitat_num[output_with_everything_sp$gps_habitat=='intermediate']<-2
+output_with_everything_sp$gps_habitat_num[output_with_everything_sp$gps_habitat=='low_change']<-3
+output_with_everything_sp$gps_habitat_num[output_with_everything_sp$gps_habitat=='not_assigned']<-4
+output_with_everything_sp$gps_habitat_num[is.na(output_with_everything_sp$gps_habitat_num)]<-5
+
+
+output_with_everything_sp$habitat_sim_arg_centre_num[output_with_everything_sp$habitat_sim_arg_centre=='high_change']<-1
+output_with_everything_sp$habitat_sim_arg_centre_num[output_with_everything_sp$habitat_sim_arg_centre=='intermediate']<-2
+output_with_everything_sp$habitat_sim_arg_centre_num[output_with_everything_sp$habitat_sim_arg_centre=='low_change']<-3
+output_with_everything_sp$habitat_sim_arg_centre_num[output_with_everything_sp$habitat_sim_arg_centre=='not_assigned']<-4
+output_with_everything_sp$habitat_sim_arg_centre_num[is.na(output_with_everything_sp$habitat_sim_arg_centre)]<-5
+
+
+output_with_everything_sp$ctmm_predicted_habitat_num[output_with_everything_sp$ctmm_predicted_habitat=='high_change']<-1
+output_with_everything_sp$ctmm_predicted_habitat_num[output_with_everything_sp$ctmm_predicted_habitat=='intermediate']<-2
+output_with_everything_sp$ctmm_predicted_habitat_num[output_with_everything_sp$ctmm_predicted_habitat=='low_change']<-3
+output_with_everything_sp$ctmm_predicted_habitat_num[output_with_everything_sp$ctmm_predicted_habitat=='not_assigned']<-4
+output_with_everything_sp$ctmm_predicted_habitat_num[is.na(output_with_everything_sp$ctmm_predicted_habitat)]<-5
+
+output_with_everything_sp$most.present.habitat_ctmm_sim_num[output_with_everything_sp$most.present.habitat_ctmm_sim=='high_change']<-1
+output_with_everything_sp$most.present.habitat_ctmm_sim_num[output_with_everything_sp$most.present.habitat_ctmm_sim=='intermediate']<-2
+output_with_everything_sp$most.present.habitat_ctmm_sim_num[output_with_everything_sp$most.present.habitat_ctmm_sim=='low_change']<-3
+output_with_everything_sp$most.present.habitat_ctmm_sim_num[output_with_everything_sp$most.present.habitat_ctmm_sim=='not_assigned']<-4
+
+
+par(mfrow=c(2,2))
+
+#GPS
+plot(st_p, border=NA)
+plot(st_geometry(Cur_sp), border=grey(0.8), col=clrs_map[Cur_sp$habitat_num],add=T)
+plot(output_with_everything_sp,pch='.',cex=4,col=clrs[output_with_everything_sp$gps_habitat_num],add=TRUE)
+
+
+#Argos
+plot(st_p, border=NA)
+plot(st_geometry(Cur_sp), border=grey(0.8), col=clrs_map[Cur_sp$habitat_num],add=T)
+plot(output_with_everything_sp,pch='.',cex=4,col=clrs[output_with_everything_sp$habitat_sim_arg_centre_num],add=TRUE)
+
+#CTMM
+plot(st_p, border=NA)
+plot(st_geometry(Cur_sp), border=grey(0.8), col=clrs_map[Cur_sp$habitat_num],add=T)
+plot(output_with_everything_sp,pch='.',cex=4,col=clrs[output_with_everything_sp$ctmm_predicted_habitat_num],add=TRUE)
+
+#most likely habitat
+plot(st_p, border=NA)
+plot(st_geometry(Cur_sp), border=grey(0.8), col=clrs_map[Cur_sp$habitat_num],add=T)
+plot(output_with_everything_sp,pch='.',cex=4,col=clrs[output_with_everything_sp$most.present.habitat_ctmm_sim_num],add=TRUE)
+
+
+##FIGURE 6A. 
+#The proportion of habitats visited by the GPS-tagged Black-tailed Godwit, as revealed from the locations from a reference GPS transmitter (small red asterisk) and from (simulated) Argos Doppler locations using the three tested approaches: raw Argos (filled grey dots), SSM (filled white dots), and most likely habitat (red dots with blue fill). The result is obtained during one iteration of the bootstrap procedure. The blue box-whisker plots represent the distribution of proportions of each habitat among the locations in the simulated Argos track, as revealed by the most likely habitat approach.
+
+load(paste0("D:\\...\\", Files[1]))
+
+HC<-as.data.frame(output_with_everything$ctmm_simulation_high_change)/100
+   names(HC)<-'number'
+   HC$habitat<-'high_change'
+   Int<-as.data.frame(output_with_everything$ctmm_simulation_intermediate)/100
+   names(Int)<-'number'
+   Int$habitat<-'intermediate'
+   LC<-as.data.frame(output_with_everything$ctmm_simulation_low_change)/100
+   names(LC)<-'number'
+   LC$habitat<-'low_change'
+   NAss<-as.data.frame(output_with_everything$ctmm_simulation_not_assigned)/100
+   names(NAss)<-'number'
+   NAss$habitat<-'not_assigned'
+for_boxplot_sim<-rbind(HC, Int,LC,NAss)
+
+
+boxplot(number~as.factor(habitat),for_boxplot_sim,col = 'darkseagreen1', medcol = 'grey', boxlty = 0, pch='.')
+
+
+argos_output<-as.data.frame(c(as.vector(table(output_with_everything$ habitat_sim_arg_centre))/1819))
+names(argos_output)<-'number'
+habitat<-c('high_change', 'intermediate', 'low_change','not_assigned')
+argos_output<-cbind(argos_output,habitat)
+stripchart(number ~ habitat,
+           data = argos_output,
+           #method = "jitter",
+           pch = 19,
+		   cex=2,
+           #col = 2:4,
+		   col=grey(0.5),
+           vertical = TRUE,
+           add = TRUE)
+
+ctmm_output<-as.data.frame(c(as.vector(table(output_with_everything$ ctmm_predicted_habitat))/1819))
+names(ctmm_output)<-'number'
+habitat<-c('high_change', 'intermediate', 'low_change','not_assigned')
+ctmm_output<-cbind(ctmm_output,habitat)
+stripchart(number ~ habitat,
+           data = ctmm_output,
+           #method = "jitter",
+           pch = 21,
+		   cex=2,
+           #col = 2:4,
+		   bg='white',
+		   col=grey(0.5),
+           vertical = TRUE,
+           add = TRUE)
+		   
+		   
+ML_output<-as.data.frame(c(as.vector(table(output_with_everything$ most.present.habitat_ctmm_sim))/1819))
+names(ML_output)<-'number'
+habitat<-c('high_change', 'intermediate', 'low_change','not_assigned')
+ML_output<-cbind(ML_output,habitat)
+stripchart(number ~ habitat,
+           data = ML_output,
+           #method = "jitter",
+            pch = 21,
+		  cex=2,
+           #col = 2:4,
+		   col='red',
+		   bg='darkseagreen1',
+		   lwd=3,
+		   vertical = TRUE,
+           add = TRUE)   
+		   
+gps_output<-as.data.frame(c(as.vector(table(output_with_everything$gps_habitat))/1819))
+names(gps_output)<-'number'
+habitat<-c('high_change', 'intermediate', 'low_change','not_assigned')
+gps_output<-cbind(gps_output,habitat)
+stripchart(number ~ habitat,
+           data = gps_output,
+           #method = "jitter",
+           #pch = 25,
+		    pch = '*',
+		   cex=2,
+           #col = 2:4,
+		   col='red',
+		   bg='2',
+		   lwd=2,
+		   vertical = TRUE,
+           add = TRUE)
+
+	
+##FIGURE 6B. 
+#The proportion of location points in a 100-iteration bootstrap procedure, for which habitat types coincided with habitat types assigned based on the GPS reference locations. 
+
+All_out<-c()
+
+for (file in 1:length(Files)) {
+cat(file, '\r')	
+
+load(paste0("D:\\...", Files[file]))
+
+output_with_everything<-output_with_everything[!is.na(output_with_everything$gps_habitat),]
+
+output_with_everything$coincide_gps_arg_centre<-0
+output_with_everything$coincide_gps_ctmm<-0
+output_with_everything$coincide_gps_ctmm_most_likely_habitat<-0
+
+output_with_everything$coincide_gps_arg_centre[output_with_everything$gps_habitat==output_with_everything$habitat_sim_arg_centre & !is.na(output_with_everything$gps_habitat)]<-1
+output_with_everything$coincide_gps_ctmm[output_with_everything$gps_habitat==output_with_everything$ctmm_predicted_habitat & !is.na(output_with_everything$gps_habitat)]<-1
+output_with_everything$coincide_gps_ctmm_most_likely_habitat[output_with_everything$gps_habitat==output_with_everything$most.present.habitat_ctmm_sim & !is.na(output_with_everything$gps_habitat)]<-1
+
+		   All_out<-rbind(All_out, c('coincide_gps_arg_centre',sum(output_with_everything$coincide_gps_arg_centre),nrow(output_with_everything)),
+		   c('coincide_gps_ctmm',sum(output_with_everything$coincide_gps_ctmm),nrow(output_with_everything)),
+		   c('coincide_gps_ctmm_most_likely_habitat',sum(output_with_everything$coincide_gps_ctmm_most_likely_habitat),nrow(output_with_everything)))	   
+		     
+}
+
+
+All_out<-as.data.frame(All_out)
+str(All_out)
+ names(All_out)<-c('method','coincidence_rate','nr_noNA_fixes')
+All_out$coincidence_rate<-as.numeric(All_out$coincidence_rate)
+All_out$nr_noNA_fixes<-as.numeric(All_out$nr_noNA_fixes)
+All_out$coincidence_rate_prop<-All_out$coincidence_rate/All_out$nr_noNA_fixes
+All_out$method_index[All_out$method=='coincide_gps_arg_centre']<-'Argos location'
+All_out$method_index[All_out$method=='coincide_gps_ctmm']<-'ctmm location'
+All_out$method_index[All_out$method=='coincide_gps_ctmm_most_likely_habitat']<-'ML habitat'
+
+#Plot the coinidence rate (FIGURE 6B)
+plot(All_out$coincidence_rate_prop~as.factor(All_out$method_index),ylab='Rate of coincidence with GPS habitat assignments', xlab='', boxlty = 0, ylim=c(0,1))
+
+```
