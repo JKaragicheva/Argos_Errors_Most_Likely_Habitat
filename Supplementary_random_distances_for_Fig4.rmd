@@ -1,6 +1,4 @@
-# in this script I want to look into distribution of distances in the Argos fixes.
-# for this I want to generate 100 rndom points for each fix we have
-# and estimate distance between the point and the centre...
+# In this script we  assess distribution of distances in the Argos fixes. For this, we generate 100 random points for each fix and estimate distance between the point and the centre...
 
 
 get_ellipse_random_ditances<-function(n, data_row) {
